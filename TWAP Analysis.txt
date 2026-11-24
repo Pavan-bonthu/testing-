@@ -1,0 +1,7 @@
+TWAP Analysis
+12456
+No TWAP analysis for this ticket yet
+
+Run this on the log server, then refresh:
+
+python3 twap_export.py --ticket 12456 --upload
