@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+TWAP JSON exporter for IOB LogDesk.
+
+Reuses twap_algo_analyser.py (same folder), builds a JSON document per TWAP
+basket (with Nest/Exchange order no. 64001 on every message) and optionally
+saves it into MySQL (table twap_analysis) so the web app's "TWAP Analysis"
+page can display it.
+
+Usage
+-----
+  python3 twap_export.py --ticket TKT-10245
+  python3 twap_export.py --ticket TKT-10245 --algo /IOBLOGS/TKT-10245/nest_algo_engine.mnm --upload
+  python3 twap_export.py --ticket TKT-10245 --basket 2026070800074,2026070800075 --upload
+  python3 twap_export.py --ticket TKT-10245 --input-file extracted.txt --out twap.json
+
+--upload needs:  pip install pymysql
+and env vars:    MYSQL_HOST (default localhost), MYSQL_PORT (3306), MYSQL_USER,
+                 MYSQL_PASSWORD, MYSQL_DATABASE
+"""
+
+import argparse
+import gzip
+import json
+import os
+import shutil
+import sys
+import tarfile
+import tempfile
+import zipfile
+from datetime import datetime
+
+import twap_algo_analyser as T
+# ---------------------------------------------------------------------------
+# LOG FILE FINDER  (plain files, .tar.gz / .tgz / .tar / .zip / .gz archives)
+# ---------------------------------------------------------------------------
+LOG_PREFIX = "nest_algo_engine"          # real name may end with dates / bkp etc.
+LOG_BASES = [os.environ.get("TWAP_LOG_BASE", "/IOB_LOG"), "/IOBLOGS"]
+ARCHIVE_EXT = (".tar", ".tgz", ".tar.gz", ".tbz2", ".tar.bz2", ".txz", ".tar.xz",
+               ".zip", ".gz", ".bz2", ".xz")
+
+
+def _is_log_name(name):
+    return os.path.basename(name).lower().startswith(LOG_PREFIX)
+
+
+def _safe_name(i, name):
+    return "%d_%s" % (i, os.path.basename(name).replace(os.sep, "_"))
+
+
+def _extract_from_archive(path, dest, found):
+    """Pull only nest_algo_engine* members out of an archive into dest."""
+    base = os.path.basename(path)
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    if info.is_dir() or not _is_log_name(info.filename):
+                        continue
+                    out = os.path.join(dest, _safe_name(len(found), info.filename))
+                    with z.open(info) as src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                    found.append((out, "%s!%s" % (path, info.filename)))
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path, "r:*") as t:
+                for m in t:                      # stream through, extract matches only
+                    if not m.isfile() or not _is_log_name(m.name):
+                        continue
+                    out = os.path.join(dest, _safe_name(len(found), m.name))
+                    src = t.extractfile(m)
+                    if src is None:
+                        continue
+                    with src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                    found.append((out, "%s!%s" % (path, m.name)))
+        else:
+            # single compressed file, e.g. nest_algo_engine.mnm.20261124.gz
+            if not _is_log_name(base):
+                return
+            opener = {".gz": gzip.open}.get(os.path.splitext(base)[1].lower())
+            if opener is None:
+                import bz2, lzma
+                opener = {".bz2": bz2.open, ".xz": lzma.open}.get(
+                    os.path.splitext(base)[1].lower())
+            if opener is None:
+                return
+            out = os.path.join(dest, _safe_name(len(found), os.path.splitext(base)[0]))
+            with opener(path, "rb") as src, open(out, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            found.append((out, path))
+    except (OSError, EOFError, tarfile.TarError, zipfile.BadZipFile) as e:
+        print("  WARNING: could not read archive %s (%s)" % (path, e))
+
+
+def find_algo_files(target, tmp_dir):
+    """Return [(path_for_oselect, description)] for every nest_algo_engine* log
+    found in `target` (a file, an archive, or a folder searched recursively).
+    Archives are unpacked (only the matching file) into tmp_dir."""
+    found = []
+    if os.path.isfile(target):
+        files = [target]
+    else:
+        files = []
+        for root, _dirs, names in os.walk(target):
+            for n in sorted(names):
+                files.append(os.path.join(root, n))
+    for f in files:
+        low = f.lower()
+        if low.endswith(ARCHIVE_EXT) or zipfile.is_zipfile(f) and not _is_log_name(f):
+            _extract_from_archive(f, tmp_dir, found)
+        elif _is_log_name(f):
+            with open(f, "rb") as fh:
+                magic = fh.read(4)
+            if magic[:2] == b"\x1f\x8b" or magic[:2] == b"PK" or tarfile.is_tarfile(f):
+                _extract_from_archive(f, tmp_dir, found)   # compressed but oddly named
+            else:
+                found.append((f, f))
+    return found
+
+
+def locate_logs(ticket, algo_arg):
+    if algo_arg:
+        return algo_arg
+    for base in LOG_BASES:
+        d = os.path.join(base, ticket)
+        if os.path.isdir(d):
+            return d
+    raise SystemExit("No log folder for ticket %s under: %s" % (ticket, ", ".join(LOG_BASES)))
+
+
+def trace_rows(msgs):
+    rows = []
+    for m in msgs:
+        if m["message_id"] == "price_volume_update":
+            continue
+        rows.append(
+            {
+                "exch_order_no": m["exch_ono"] or "",  # field 64001
+                "seq": m["msg_seq"] or "",
+                "time": T.fmt_ts(m["ts_int"]),
+                "status": (m["request"] or m["status"] or m["event_t"] or ""),
+                "qty": m["qty_to_fill"] or "",
+                "price": T.fmt_price(m["price"]) if m["price"] else "",
+                "event": m["message_id"] or m["event_t"] or "",
+            }
+        )
+    return rows
+
+
+def order_to_dict(o):
+    wave_anal = {wid: T.analyse_wave(msgs) for wid, msgs in o["waves"].items()}
+
+    def wave_ts(wid):
+        a = wave_anal[wid]
+        return a["msgs_sorted"][0]["ts_int"] if a["msgs_sorted"] else 0
+
+    sorted_waves = sorted(wave_anal, key=wave_ts)
+
+    parent_qty = o["parent_qty"]
+    total_wave_qty = sum(a["qty_to_fill"] for a in wave_anal.values())
+    total_filled = sum(a["filled_qty"] for a in wave_anal.values())
+    total_remaining = sum(a["remaining"] for a in wave_anal.values())
+    total_fills = sum(a["fill_count"] for a in wave_anal.values())
+
+    last_pending = None
+    for m in sorted(o["all_msgs"], key=lambda x: x["ts_int"]):
+        if m["qty_pending"] not in ("", "None", None):
+            try:
+                last_pending = int(m["qty_pending"])
+            except (ValueError, TypeError):
+                pass
+
+    final_status = o["statuses"][-1] if o["statuses"] else "unknown"
+    issues = []
+    if "rejected" in o["statuses"]:
+        issues.append("REJECTED by exchange")
+    if "cancelled" in o["statuses"]:
+        issues.append("ORDER CANCELLED")
+    if not sorted_waves and parent_qty > 0:
+        issues.append("NO WAVES FOUND - algo may not have triggered")
+    if total_remaining > 0 and final_status in ("complete", "cancelled"):
+        issues.append("PARTIAL FILL - %s qty not executed" % T.fmt_qty(total_remaining))
+    if last_pending and final_status == "complete":
+        issues.append("QTY_PENDING (%s) != 0 at order end" % last_pending)
+    manual = sorted(
+        {
+            m["request"]
+            for m in o["interventions"]
+            if m["request"] not in ("om_out_order", "GATE_SERVICE_algo_assign_waves")
+        }
+    )
+    if manual:
+        issues.append("MANUAL INTERVENTION detected: " + ", ".join(manual))
+
+    waves = []
+    exch_orders = {}  # nest order no -> aggregated info
+    for wid in sorted_waves:
+        a = wave_anal[wid]
+        rows = trace_rows(a["msgs_sorted"])
+        waves.append(
+            {
+                "wave_id": wid,
+                "time": T.fmt_ts(a["msgs_sorted"][0]["ts_int"]) if a["msgs_sorted"] else "",
+                "status": a["final_status"],
+                "qty": a["qty_to_fill"],
+                "filled": a["filled_qty"],
+                "remaining": a["remaining"],
+                "pending": a["qty_pending"],
+                "price": T.fmt_price(a["price"]),
+                "avg_price": T.fmt_price(a["avg_price"]) if a["avg_price"] else "",
+                "fill_count": a["fill_count"],
+                "fills": [
+                    {
+                        "qty": f["qty"],
+                        "price": T.fmt_price(f["price"]),
+                        "time": T.fmt_ts(f["time"]),
+                        "exch_order_no": f["exch"] or "",
+                    }
+                    for f in a["fills"]
+                ],
+                "trace": rows,
+            }
+        )
+        for r in rows:
+            ono = r["exch_order_no"]
+            if not ono:
+                continue
+            e = exch_orders.setdefault(
+                ono,
+                {
+                    "exch_order_no": ono,
+                    "wave_id": wid,
+                    "first_time": r["time"],
+                    "last_status": "",
+                    "qty": r["qty"],
+                    "price": r["price"],
+                    "events": [],
+                },
+            )
+            e["last_status"] = r["status"] or e["last_status"]
+            e["events"].append(r)
+
+    return {
+        "basket_id": o["basket_id"],
+        "trading_symbol": o["trading_symbol"],
+        "exchange_seg": o["exchange_seg"],
+        "service": o["service"],
+        "account_id": o["account_id"],
+        "transaction": T.side_str(o["transaction"]),
+        "product": o["product"],
+        "order_type": o["order_type"],
+        "algo_type": o["algo_type"],
+        "exec_style": o["exec_style"],
+        "disclosed_qty": o["disclosed_qty"],
+        "volume_percentage": o["volume_percentage"],
+        "order_duration": o["order_duration"],
+        "parent_qty": parent_qty,
+        "parent_price": T.fmt_price(o["parent_price"]),
+        "start_time": o["start_time"],
+        "end_time": o["end_time"],
+        "statuses": o["statuses"],
+        "summary": {
+            "total_wave_qty": total_wave_qty,
+            "total_filled": total_filled,
+            "total_remaining": total_remaining,
+            "fill_pct": round(total_filled / parent_qty * 100, 1) if parent_qty else 0,
+            "qty_pending_last": last_pending,
+            "total_fills": total_fills,
+            "interventions": len(o["interventions"]),
+            "pv_updates": len(o["pv_updates"]),
+        },
+        "interventions": [
+            {
+                "time": T.fmt_ts(m["ts_int"]),
+                "request": m["request"] or m["event_t"] or "",
+                "seq": m["msg_seq"] or "",
+                "exch_order_no": m["exch_ono"] or "",
+            }
+            for m in sorted(o["interventions"], key=lambda x: x["ts_int"])
+        ],
+        "issues": issues,
+        "waves": waves,
+        "exch_orders": list(exch_orders.values()),
+    }
+
+
+DDL = """
+CREATE TABLE IF NOT EXISTS twap_analysis (
+  ticket_number VARCHAR(64) NOT NULL PRIMARY KEY,
+  payload LONGTEXT NOT NULL,
+  generated_at DATETIME NOT NULL
+) CHARACTER SET utf8mb4
+"""
+
+
+def upload(ticket, payload):
+    try:
+        import pymysql
+    except ImportError:
+        raise SystemExit("pip install pymysql to use --upload")
+    try:
+        user = os.environ["MYSQL_USER"]
+        db = os.environ["MYSQL_DATABASE"]
+    except KeyError as e:
+        raise SystemExit("Set env var %s (and MYSQL_PASSWORD) to use --upload" % e.args[0])
+    conn = pymysql.connect(
+        host=os.environ.get("MYSQL_HOST", "localhost"),
+        port=int(os.environ.get("MYSQL_PORT", "3306")),
+        user=user,
+        password=os.environ.get("MYSQL_PASSWORD", ""),
+        database=db,
+        charset="utf8mb4",
+    )
+    safe = "".join(c for c in ticket.strip() if c.isalnum() or c in "-_")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(DDL)
+            cur.execute(
+                "INSERT INTO twap_analysis (ticket_number, payload, generated_at) "
+                "VALUES (%s, %s, NOW()) "
+                "ON DUPLICATE KEY UPDATE payload = VALUES(payload), generated_at = NOW()",
+                (safe, payload),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    print("  Saved to MySQL table twap_analysis (ticket %s)" % safe)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="TWAP analysis -> JSON (+ optional Supabase upload)")
+    ap.add_argument("--ticket", required=True, help="Ticket number, e.g. TKT-10245")
+    ap.add_argument("--algo", default=None, help="Log file, archive or folder (default: <log base>/<ticket>, searched recursively)")
+    ap.add_argument("--input-file", dest="input_file", default=None)
+    ap.add_argument("--basket", default=None, help="Comma separated basket ids to keep")
+    ap.add_argument("--oselect", default=T.OSELECT_BIN)
+    ap.add_argument("--timeout", type=int, default=T.OSELECT_TIMEOUT)
+    ap.add_argument("--out", default=None, help="Also write JSON to this path (default: only when not using --upload)")
+    ap.add_argument("--upload", action="store_true")
+    args = ap.parse_args()
+
+    if args.input_file:
+        with open(args.input_file) as fh:
+            lines = fh.read().splitlines()
+        source = args.input_file
+    else:
+        target = locate_logs(args.ticket, args.algo)
+        tmp_dir = tempfile.mkdtemp(prefix="twap_")
+        try:
+            logs = find_algo_files(target, tmp_dir)
+            if not logs:
+                raise SystemExit(
+                    "No %s* file found (looked in folders and archives under %s)"
+                    % (LOG_PREFIX, target))
+            print("  Found %d log file(s):" % len(logs))
+            for _p, desc in logs:
+                print("    - " + desc)
+            lines = []
+            for p, _desc in logs:
+                lines.extend(T.run_oselect(p, args.oselect, args.timeout))
+            if len(logs) > 1:                       # same record in two copies (e.g. .bkp)
+                lines = list(dict.fromkeys(lines))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        source = "; ".join(d for _p, d in logs)
+
+    if not lines:
+        sys.exit("No data extracted.")
+
+    orders = T.build_orders(lines)
+    if args.basket:
+        keep = {b.strip() for b in args.basket.split(",") if b.strip()}
+        orders = {k: v for k, v in orders.items() if k in keep}
+    if not orders:
+        sys.exit("No TWAP orders found.")
+
+    doc = {
+        "ticket": args.ticket,
+        "source": source,
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "orders": [order_to_dict(o) for o in orders.values()],
+    }
+    payload = json.dumps(doc, ensure_ascii=False)
+    # Only write a local file when asked (--out) or when not uploading.
+    out = args.out or (None if args.upload else "twap_analysis.json")
+    if out:
+        with open(out, "w") as fh:
+            fh.write(payload)
+        print("  %d TWAP order(s) written to %s" % (len(doc["orders"]), out))
+    else:
+        print("  %d TWAP order(s) analysed" % len(doc["orders"]))
+    if args.upload:
+        upload(args.ticket, payload)
+
+
+if __name__ == "__main__":
+    main()
