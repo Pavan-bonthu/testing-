@@ -1,0 +1,13 @@
+[root@NMDC09-V-R372-OMNET-IOB-WEB-SRV01 IOB_LOG]# twap-analyse 13001
+  Found 1 log file(s):
+    - /IOB_LOG/13001/OneTouchVwapIssue_12Nov2026.tar.gz!OneTouchVwapIssue_12Nov2026/nest_algo_engine.mnm.20261113.tar.gz
+  CMD : /else/apps/OmneUtils/18.0.0.0/linux-gnu-2.6.18-x86_64/bin/oselect /tmp/twap_3eo0soeh/0_nest_algo_engine.mnm.20261113.tar.gz stdout
+  Full file scan - this may take a moment ...
+Traceback (most recent call last):
+  File "/opt/iob/twap/twaptest.py", line 397, in <module>
+    main()
+  File "/opt/iob/twap/twaptest.py", line 360, in main
+    lines.extend(T.run_oselect(p, args.oselect, args.timeout))
+  File "/opt/iob/twap/twap_algo_analyser.py", line 259, in run_oselect
+    raise RuntimeError("oselect error rc=" + str(r.returncode) + ": " + r.stderr)
+RuntimeError: oselect error rc=255:
